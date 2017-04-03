@@ -49,6 +49,9 @@ DECL_WINDOWS_FUNCTION(static, SECURITY_STATUS,
 DECL_WINDOWS_FUNCTION(static, SECURITY_STATUS,
 		      MakeSignature,
 		      (PCtxtHandle, ULONG, PSecBufferDesc, ULONG));
+DECL_WINDOWS_FUNCTION(static, DLL_DIRECTORY_COOKIE,
+			  AddDllDirectory,
+			  (PCWSTR));
 
 typedef struct winSsh_gss_ctx {
     unsigned long maj_stat;
@@ -72,6 +75,11 @@ struct ssh_gss_liblist *ssh_gss_setup(Conf *conf)
     HKEY regkey;
     struct ssh_gss_liblist *list = snew(struct ssh_gss_liblist);
     char *path;
+	static HMODULE kernel32_module;
+	if (!kernel32_module) {
+		kernel32_module = load_system32_dll("kernel32.dll");
+	}
+	GET_WINDOWS_FUNCTION(kernel32_module, AddDllDirectory);
 
     list->libraries = snewn(3, struct ssh_gss_library);
     list->nlibraries = 0;
@@ -81,32 +89,41 @@ struct ssh_gss_liblist *ssh_gss_setup(Conf *conf)
     module = NULL;
     if (RegOpenKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\MIT\\Kerberos", &regkey)
 	== ERROR_SUCCESS) {
-	DWORD type, size;
-	LONG ret;
-	char *buffer;
+		DWORD type, size;
+		LONG ret;
+		char *buffer;
+		wchar_t *dllPath;
 
-	/* Find out the string length */
+		/* Find out the string length */
         ret = RegQueryValueEx(regkey, "InstallDir", NULL, &type, NULL, &size);
 
-	if (ret == ERROR_SUCCESS && type == REG_SZ) {
-	    buffer = snewn(size + 20, char);
-	    ret = RegQueryValueEx(regkey, "InstallDir", NULL,
-				  &type, (LPBYTE)buffer, &size);
-	    if (ret == ERROR_SUCCESS && type == REG_SZ) {
-		strcat(buffer, "\\bin\\gssapi32.dll");
-		module = LoadLibrary(buffer);
-	    }
-	    sfree(buffer);
-	}
-	RegCloseKey(regkey);
+		if (ret == ERROR_SUCCESS && type == REG_SZ) {
+			buffer = snewn(size + 20, char);
+			ret = RegQueryValueEx(regkey, "InstallDir", NULL,
+					  &type, (LPBYTE)buffer, &size);
+			if (ret == ERROR_SUCCESS && type == REG_SZ) {
+				strcat (buffer, "\\bin");
+				if(p_AddDllDirectory) {
+					/* Add MIT Kerberos' path to the DLL search path, it loads its own DLLs further down the road */
+					dllPath = snewn(size + 21, wchar_t);
+					mbstowcs(dllPath, buffer, size + 21);
+					p_AddDllDirectory(dllPath);
+					sfree(dllPath);
+				}
+				strcat (buffer, "\\gssapi32.dll");
+				module = LoadLibraryEx (buffer, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS);
+			}
+			sfree(buffer);
+		}
+		RegCloseKey(regkey);
     }
     if (module) {
-	struct ssh_gss_library *lib =
-	    &list->libraries[list->nlibraries++];
+		struct ssh_gss_library *lib =
+			&list->libraries[list->nlibraries++];
 
-	lib->id = 0;
-	lib->gsslogmsg = "Using GSSAPI from GSSAPI32.DLL";
-	lib->handle = (void *)module;
+		lib->id = 0;
+		lib->gsslogmsg = "Using GSSAPI from GSSAPI32.DLL";
+		lib->handle = (void *)module;
 
 #define BIND_GSS_FN(name) \
     lib->u.gssapi.name = (t_gss_##name) GetProcAddress(module, "gss_" #name)
@@ -128,22 +145,22 @@ struct ssh_gss_liblist *ssh_gss_setup(Conf *conf)
     /* Microsoft SSPI Implementation */
     module = load_system32_dll("secur32.dll");
     if (module) {
-	struct ssh_gss_library *lib =
-	    &list->libraries[list->nlibraries++];
+		struct ssh_gss_library *lib =
+			&list->libraries[list->nlibraries++];
 
-	lib->id = 1;
-	lib->gsslogmsg = "Using SSPI from SECUR32.DLL";
-	lib->handle = (void *)module;
+		lib->id = 1;
+		lib->gsslogmsg = "Using SSPI from SECUR32.DLL";
+		lib->handle = (void *)module;
 
-	GET_WINDOWS_FUNCTION(module, AcquireCredentialsHandleA);
-	GET_WINDOWS_FUNCTION(module, InitializeSecurityContextA);
-	GET_WINDOWS_FUNCTION(module, FreeContextBuffer);
-	GET_WINDOWS_FUNCTION(module, FreeCredentialsHandle);
-	GET_WINDOWS_FUNCTION(module, DeleteSecurityContext);
-	GET_WINDOWS_FUNCTION(module, QueryContextAttributesA);
-	GET_WINDOWS_FUNCTION(module, MakeSignature);
+		GET_WINDOWS_FUNCTION(module, AcquireCredentialsHandleA);
+		GET_WINDOWS_FUNCTION(module, InitializeSecurityContextA);
+		GET_WINDOWS_FUNCTION(module, FreeContextBuffer);
+		GET_WINDOWS_FUNCTION(module, FreeCredentialsHandle);
+		GET_WINDOWS_FUNCTION(module, DeleteSecurityContext);
+		GET_WINDOWS_FUNCTION(module, QueryContextAttributesA);
+		GET_WINDOWS_FUNCTION(module, MakeSignature);
 
-	ssh_sspi_bind_fns(lib);
+		ssh_sspi_bind_fns(lib);
     }
 
     /*
@@ -152,16 +169,36 @@ struct ssh_gss_liblist *ssh_gss_setup(Conf *conf)
     module = NULL;
     path = conf_get_filename(conf, CONF_ssh_gss_custom)->path;
     if (*path) {
-	module = LoadLibrary(path);
+		if(p_AddDllDirectory) {
+			wchar_t *dllPath = snewn(_MAX_DRIVE + _MAX_DIR, wchar_t);
+			char *drive = snewn(_MAX_DRIVE, char);
+			char *dir = snewn(_MAX_DIR, char);
+			char *combinedPath = snewn(_MAX_DRIVE + _MAX_DIR, char);
+			/* Add the custom directory as well in case it chainloads some other DLLs (e.g a non-installed MIT Kerberos instance) */
+			
+			_splitpath_s(path, drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
+			strcpy(combinedPath, drive);
+			strcat(combinedPath, dir);
+			mbstowcs(dllPath, combinedPath, strlen(combinedPath) + 1);
+			
+			p_AddDllDirectory(dllPath);
+			sfree(dllPath);
+			sfree(combinedPath);
+			sfree(dir);
+			sfree(drive);
+		}
+		
+		
+		module = LoadLibraryEx(path, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS);
     }
     if (module) {
-	struct ssh_gss_library *lib =
-	    &list->libraries[list->nlibraries++];
+		struct ssh_gss_library *lib =
+			&list->libraries[list->nlibraries++];
 
-	lib->id = 2;
-	lib->gsslogmsg = dupprintf("Using GSSAPI from user-specified"
-				   " library '%s'", path);
-	lib->handle = (void *)module;
+		lib->id = 2;
+		lib->gsslogmsg = dupprintf("Using GSSAPI from user-specified"
+					   " library '%s'", path);
+		lib->handle = (void *)module;
 
 #define BIND_GSS_FN(name) \
     lib->u.gssapi.name = (t_gss_##name) GetProcAddress(module, "gss_" #name)
